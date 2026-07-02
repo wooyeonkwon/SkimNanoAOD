@@ -1,6 +1,4 @@
 #include <ROOT/RDataFrame.hxx>
-#include <ROOT/RDF/RSnapshotOptions.hxx>
-#include <ROOT/RCompressionSetting.hxx>
 #include <TFile.h>
 #include <TTree.h>
 
@@ -232,7 +230,6 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   fs::create_directories(scratchFile.parent_path());
   ROOT::RDF::RSnapshotOptions options;
   options.fMode = "RECREATE";
-  options.fCompressionAlgorithm = ROOT::RCompressionSetting::EAlgorithm::kZLIB;
   options.fCompressionLevel = 4;
   filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
 }
