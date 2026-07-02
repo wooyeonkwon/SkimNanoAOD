@@ -1,0 +1,49 @@
+{
+  "threads": 8,
+  "input_base_directory": "/data2/common/NanoAOD/",
+  "output_base_directory": "/data2/common/skimmed_NanoAOD/",
+  "scratch_directory": "/scratch",
+  "scratch_flush_bytes": 53687091200,
+  "input_directories": [
+    "mc/v15/RunIII2024Summer24NanoAODv15/TTtoLNu2Q_TuneCP5_13p6TeV_powheg-pythia8/"
+  ],
+  "branches": [
+    "run",
+    "luminosityBlock",
+    "event",
+    "PV_npvs",
+    "PV_npvsGood",
+    "nMuon",
+    "Muon_pt",
+    "Muon_eta",
+    "Muon_phi",
+    "Muon_mass",
+    "Muon_charge",
+    "Muon_tightId",
+    "Muon_pfRelIso04_all",
+    "nElectron",
+    "Electron_pt",
+    "Electron_eta",
+    "Electron_phi",
+    "Electron_mass",
+    "Electron_charge",
+    "Electron_cutBased",
+    "nJet",
+    "Jet_pt",
+    "Jet_eta",
+    "Jet_phi",
+    "Jet_mass",
+    "Jet_jetId",
+    "Jet_btagDeepFlavB",
+    "MET_pt",
+    "MET_phi",
+    "genWeight"
+  ],
+  "hlt_paths": [
+    "HLT_IsoMu24",
+    "HLT_Ele32_WPTight_Gsf",
+    "HLT_Mu50"
+  ],
+  "progress_every_files": 100,
+  "tree_name": "Events"
+}

@@ -1,0 +1,290 @@
+#include <ROOT/RDataFrame.hxx>
+#include <ROOT/RDF/RSnapshotOptions.hxx>
+#include <ROOT/RCompressionSetting.hxx>
+#include <TFile.h>
+#include <TTree.h>
+
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <glob.h>
+#include <iomanip>
+#include <iostream>
+#include <memory>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+namespace fs = std::filesystem;
+using json = nlohmann::json;
+
+namespace {
+
+struct Config {
+  unsigned int threads = 1;
+  fs::path inputBaseDir = "/data2/common/NanoAOD";
+  fs::path outputBaseDir = "/data2/common/skimmed_NanoAOD";
+  fs::path scratchDir = "/scratch";
+  std::uintmax_t scratchFlushBytes = 50ULL * 1024ULL * 1024ULL * 1024ULL;
+  std::vector<std::string> inputDirectories;
+  std::vector<std::string> branches;
+  std::vector<std::string> hltPaths;
+  std::size_t progressEveryFiles = 100;
+  std::string treeName = "Events";
+};
+
+class Logger {
+public:
+  explicit Logger(const fs::path &path) : file_(path) {
+    if (!file_) throw std::runtime_error("Cannot open log file: " + path.string());
+  }
+
+  template <typename... Args> void info(Args &&...args) { write("INFO", std::forward<Args>(args)...); }
+  template <typename... Args> void warning(Args &&...args) { write("WARNING", std::forward<Args>(args)...); }
+  template <typename... Args> void error(Args &&...args) { write("ERROR", std::forward<Args>(args)...); }
+
+private:
+  template <typename... Args> void write(const char *level, Args &&...args) {
+    std::ostringstream message;
+    (message << ... << args);
+    const auto line = timestampNow() + " [" + level + "] " + message.str();
+    std::cout << line << '\n';
+    file_ << line << '\n';
+    file_.flush();
+  }
+
+  static std::string timestampNow() {
+    const auto now = std::chrono::system_clock::now();
+    const auto t = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_r(&t, &tm);
+    std::ostringstream os;
+    os << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+    return os.str();
+  }
+
+  std::ofstream file_;
+};
+
+std::string runTimestamp() {
+  const auto now = std::chrono::system_clock::now();
+  const auto t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  std::ostringstream os;
+  os << std::put_time(&tm, "%Y%m%d_%H%M%S");
+  return os.str();
+}
+
+std::vector<std::string> getStringArray(const json &j, const char *key, bool required = true) {
+  if (!j.contains(key)) {
+    if (required) throw std::runtime_error(std::string("Missing required JSON key: ") + key);
+    return {};
+  }
+  if (!j.at(key).is_array()) throw std::runtime_error(std::string("JSON key must be an array: ") + key);
+  return j.at(key).get<std::vector<std::string>>();
+}
+
+Config loadConfig(const fs::path &path) {
+  std::ifstream input(path);
+  if (!input) throw std::runtime_error("Cannot open config JSON: " + path.string());
+  json j;
+  input >> j;
+
+  Config cfg;
+  cfg.threads = j.value("threads", cfg.threads);
+  cfg.inputBaseDir = j.value("input_base_directory", cfg.inputBaseDir.string());
+  cfg.outputBaseDir = j.value("output_base_directory", cfg.outputBaseDir.string());
+  cfg.scratchDir = j.value("scratch_directory", cfg.scratchDir.string());
+  cfg.scratchFlushBytes = j.value("scratch_flush_bytes", cfg.scratchFlushBytes);
+  cfg.inputDirectories = getStringArray(j, "input_directories");
+  cfg.branches = getStringArray(j, "branches", false);
+  cfg.hltPaths = getStringArray(j, "hlt_paths", false);
+  cfg.progressEveryFiles = j.value("progress_every_files", cfg.progressEveryFiles);
+  cfg.treeName = j.value("tree_name", cfg.treeName);
+  return cfg;
+}
+
+std::vector<fs::path> expandInputDirectories(const Config &cfg) {
+  std::set<fs::path> dirs;
+  for (const auto &pattern : cfg.inputDirectories) {
+    const fs::path fullPattern = cfg.inputBaseDir / pattern;
+    glob_t globResult{};
+    const int status = glob(fullPattern.c_str(), GLOB_TILDE, nullptr, &globResult);
+    if (status == 0) {
+      for (std::size_t i = 0; i < globResult.gl_pathc; ++i) {
+        fs::path p = fs::path(globResult.gl_pathv[i]);
+        if (fs::is_directory(p)) dirs.insert(fs::weakly_canonical(p));
+      }
+    } else if (status == GLOB_NOMATCH) {
+      fs::path p = fullPattern;
+      if (fs::is_directory(p)) dirs.insert(fs::weakly_canonical(p));
+    } else {
+      globfree(&globResult);
+      throw std::runtime_error("glob failed for pattern: " + fullPattern.string());
+    }
+    globfree(&globResult);
+  }
+  return {dirs.begin(), dirs.end()};
+}
+
+std::vector<fs::path> collectRootFiles(const std::vector<fs::path> &directories) {
+  std::vector<fs::path> files;
+  for (const auto &dir : directories) {
+    for (const auto &entry : fs::recursive_directory_iterator(dir)) {
+      if (entry.is_regular_file() && entry.path().extension() == ".root") files.push_back(entry.path());
+    }
+  }
+  std::sort(files.begin(), files.end());
+  return files;
+}
+
+std::set<std::string> treeBranches(TTree &tree) {
+  std::set<std::string> names;
+  const auto branches = tree.GetListOfBranches();
+  for (int i = 0; i < branches->GetEntries(); ++i) names.insert(branches->At(i)->GetName());
+  return names;
+}
+
+std::vector<std::string> presentFromRequested(const std::vector<std::string> &requested,
+                                              const std::set<std::string> &available,
+                                              std::vector<std::string> &missing) {
+  std::vector<std::string> present;
+  for (const auto &name : requested) {
+    if (available.count(name)) present.push_back(name);
+    else missing.push_back(name);
+  }
+  return present;
+}
+
+std::string join(const std::vector<std::string> &items, const std::string &sep) {
+  std::ostringstream os;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i) os << sep;
+    os << items[i];
+  }
+  return os.str();
+}
+
+fs::path relativeToBase(const fs::path &path, const fs::path &base) {
+  std::error_code ec;
+  auto rel = fs::relative(path, base, ec);
+  if (ec) throw std::runtime_error("Cannot compute relative path for " + path.string() + " from " + base.string());
+  return rel;
+}
+
+void flushScratch(std::vector<std::pair<fs::path, fs::path>> &pending, Logger &log) {
+  if (pending.empty()) return;
+  log.info("Flushing ", pending.size(), " skimmed file(s) from scratch to final output");
+  for (const auto &[scratch, finalPath] : pending) {
+    fs::create_directories(finalPath.parent_path());
+    std::error_code ec;
+    fs::rename(scratch, finalPath, ec);
+    if (ec) {
+      fs::copy_file(scratch, finalPath, fs::copy_options::overwrite_existing);
+      fs::remove(scratch);
+    }
+  }
+  pending.clear();
+}
+
+std::uintmax_t pendingBytes(const std::vector<std::pair<fs::path, fs::path>> &pending) {
+  std::uintmax_t total = 0;
+  for (const auto &[scratch, _] : pending) {
+    std::error_code ec;
+    const auto size = fs::file_size(scratch, ec);
+    if (!ec) total += size;
+  }
+  return total;
+}
+
+void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &scratchFile,
+                 Logger &log) {
+  std::unique_ptr<TFile> file(TFile::Open(inputFile.c_str(), "READ"));
+  if (!file || file->IsZombie()) throw std::runtime_error("Cannot open ROOT file: " + inputFile.string());
+  auto *tree = dynamic_cast<TTree *>(file->Get(cfg.treeName.c_str()));
+  if (!tree) throw std::runtime_error("Cannot find tree '" + cfg.treeName + "' in " + inputFile.string());
+
+  const auto available = treeBranches(*tree);
+  std::vector<std::string> missingBranches, missingHlt;
+  auto keptBranches = presentFromRequested(cfg.branches, available, missingBranches);
+  auto presentHlt = presentFromRequested(cfg.hltPaths, available, missingHlt);
+
+  if (!missingBranches.empty()) log.warning(inputFile, " missing branch(es): ", join(missingBranches, ", "));
+  if (!missingHlt.empty()) log.warning(inputFile, " missing HLT path(s): ", join(missingHlt, ", "));
+
+  for (const auto &hlt : presentHlt) {
+    if (std::find(keptBranches.begin(), keptBranches.end(), hlt) == keptBranches.end()) keptBranches.push_back(hlt);
+  }
+
+  file.reset();
+  ROOT::RDataFrame df(cfg.treeName, inputFile.string());
+  auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
+
+  fs::create_directories(scratchFile.parent_path());
+  ROOT::RDF::RSnapshotOptions options;
+  options.fMode = "RECREATE";
+  options.fCompressionAlgorithm = ROOT::RCompressionSetting::EAlgorithm::kZLIB;
+  options.fCompressionLevel = 4;
+  filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+}
+
+} // namespace
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    std::cerr << "Usage: " << argv[0] << " <config.json>\n";
+    return 2;
+  }
+
+  try {
+    const auto cfg = loadConfig(argv[1]);
+    if (cfg.threads > 1) ROOT::EnableImplicitMT(cfg.threads);
+
+    const fs::path runOutputDir = cfg.outputBaseDir / runTimestamp();
+    fs::create_directories(runOutputDir);
+    Logger log(runOutputDir / "skim_nanoaod.log");
+    log.info("Starting NanoAOD skim with ", cfg.threads, " thread(s)");
+
+    const auto inputDirs = expandInputDirectories(cfg);
+    if (inputDirs.empty()) throw std::runtime_error("No input directories matched the configuration");
+    const auto rootFiles = collectRootFiles(inputDirs);
+    log.info("Found ", rootFiles.size(), " ROOT file(s) under ", inputDirs.size(), " input director(y/ies)");
+
+    const fs::path scratchRunDir = cfg.scratchDir / ("skim_nanoaod_" + runOutputDir.filename().string());
+    std::vector<std::pair<fs::path, fs::path>> pending;
+    std::size_t processed = 0;
+
+    for (const auto &inputFile : rootFiles) {
+      const auto rel = relativeToBase(inputFile, cfg.inputBaseDir);
+      const fs::path scratchFile = scratchRunDir / rel;
+      const fs::path finalFile = runOutputDir / rel;
+      log.info("Skimming ", inputFile, " -> ", scratchFile);
+      skimOneFile(cfg, inputFile, scratchFile, log);
+      pending.emplace_back(scratchFile, finalFile);
+      ++processed;
+
+      if (cfg.progressEveryFiles > 0 && processed % cfg.progressEveryFiles == 0) {
+        log.info("Progress: ", processed, "/", rootFiles.size(), " file(s) processed");
+      }
+      if (pendingBytes(pending) >= cfg.scratchFlushBytes) flushScratch(pending, log);
+    }
+
+    flushScratch(pending, log);
+    fs::remove_all(scratchRunDir);
+    log.info("Finished NanoAOD skim. Output directory: ", runOutputDir);
+  } catch (const std::exception &ex) {
+    std::cerr << "ERROR: " << ex.what() << '\n';
+    return 1;
+  }
+
+  return 0;
+}
