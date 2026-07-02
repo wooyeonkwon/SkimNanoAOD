@@ -15,7 +15,7 @@ C++17/ROOT `RDataFrame::Snapshot` based NanoAOD skim utility.
 
 Dependencies:
 
-- ROOT with `RIO`, `Tree`, and `RDataFrame`
+- ROOT with `RIO`, `Tree`, and `ROOTDataFrame`
 - `nlohmann_json`
 - CMake 3.16+
 
