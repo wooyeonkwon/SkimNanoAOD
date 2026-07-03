@@ -21,6 +21,7 @@
     "Muon_charge",
     "Muon_tightId",
     "Muon_pfRelIso04_all",
+    "Muon_triggerIdLoose",
     "nElectron",
     "Electron_pt",
     "Electron_eta",
@@ -34,7 +35,7 @@
     "Jet_phi",
     "Jet_mass",
     "Jet_jetId",
-    "Jet_btagDeepFlavB",
+    "Jet_btag*",
     "MET_pt",
     "MET_phi",
     "genWeight"
@@ -42,7 +43,8 @@
   "hlt_paths": [
     "HLT_IsoMu24",
     "HLT_Ele32_WPTight_Gsf",
-    "HLT_Mu50"
+    "HLT_Mu50",
+    "HLT_PFMET*"
   ],
   "progress_every_files": 100,
   "tree_name": "Events"

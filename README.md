@@ -57,7 +57,7 @@ Important keys:
 - `scratch_directory`: temporary directory used before final flush, default `/scratch`.
 - `scratch_flush_bytes`: flush threshold for pending scratch files.
 - `input_directories`: array of directories or wildcard patterns relative to `input_base_directory`; all subdirectories are searched.
-- `branches`: branch keep list. Missing branches are logged as warnings and skipped.
-- `hlt_paths`: HLT branches combined with OR for event filtering. Missing HLT branches are logged as warnings and skipped.
+- `branches`: branch keep list. Shell-style wildcards such as `Muon_*` and `Jet_btag*` are allowed. Patterns that match no branch are logged as warnings and skipped.
+- `hlt_paths`: HLT branches combined with OR for event filtering. Shell-style wildcards such as `HLT_Mu*` are allowed. Patterns that match no HLT branch are logged as warnings and skipped.
 - `progress_every_files`: progress log frequency in processed files.
 - `tree_name`: tree to skim, normally `Events` for NanoAOD.

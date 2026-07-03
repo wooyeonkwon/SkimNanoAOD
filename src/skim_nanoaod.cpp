@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <fnmatch.h>
 #include <glob.h>
 #include <iomanip>
 #include <iostream>
@@ -145,21 +146,45 @@ std::vector<fs::path> collectRootFiles(const std::vector<fs::path> &directories)
   return files;
 }
 
-std::set<std::string> treeBranches(TTree &tree) {
-  std::set<std::string> names;
+std::vector<std::string> treeBranches(TTree &tree) {
+  std::vector<std::string> names;
   const auto branches = tree.GetListOfBranches();
-  for (int i = 0; i < branches->GetEntries(); ++i) names.insert(branches->At(i)->GetName());
+  names.reserve(branches->GetEntries());
+  for (int i = 0; i < branches->GetEntries(); ++i) names.emplace_back(branches->At(i)->GetName());
   return names;
 }
 
-std::vector<std::string> presentFromRequested(const std::vector<std::string> &requested,
-                                              const std::set<std::string> &available,
-                                              std::vector<std::string> &missing) {
+bool hasWildcard(const std::string &pattern) {
+  return pattern.find_first_of("*?[") != std::string::npos;
+}
+
+std::vector<std::string> presentFromRequestedPatterns(const std::vector<std::string> &requested,
+                                                      const std::vector<std::string> &available,
+                                                      std::vector<std::string> &missingPatterns) {
   std::vector<std::string> present;
-  for (const auto &name : requested) {
-    if (available.count(name)) present.push_back(name);
-    else missing.push_back(name);
+  std::set<std::string> seen;
+  const std::set<std::string> availableSet(available.begin(), available.end());
+
+  for (const auto &pattern : requested) {
+    std::vector<std::string> matches;
+    if (hasWildcard(pattern)) {
+      for (const auto &name : available) {
+        if (fnmatch(pattern.c_str(), name.c_str(), 0) == 0) matches.push_back(name);
+      }
+    } else if (availableSet.count(pattern)) {
+      matches.push_back(pattern);
+    }
+
+    if (matches.empty()) {
+      missingPatterns.push_back(pattern);
+      continue;
+    }
+
+    for (const auto &match : matches) {
+      if (seen.insert(match).second) present.push_back(match);
+    }
   }
+
   return present;
 }
 
@@ -212,12 +237,12 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   if (!tree) throw std::runtime_error("Cannot find tree '" + cfg.treeName + "' in " + inputFile.string());
 
   const auto available = treeBranches(*tree);
-  std::vector<std::string> missingBranches, missingHlt;
-  auto keptBranches = presentFromRequested(cfg.branches, available, missingBranches);
-  auto presentHlt = presentFromRequested(cfg.hltPaths, available, missingHlt);
+  std::vector<std::string> missingBranchPatterns, missingHltPatterns;
+  auto keptBranches = presentFromRequestedPatterns(cfg.branches, available, missingBranchPatterns);
+  auto presentHlt = presentFromRequestedPatterns(cfg.hltPaths, available, missingHltPatterns);
 
-  if (!missingBranches.empty()) log.warning(inputFile, " missing branch(es): ", join(missingBranches, ", "));
-  if (!missingHlt.empty()) log.warning(inputFile, " missing HLT path(s): ", join(missingHlt, ", "));
+  if (!missingBranchPatterns.empty()) log.warning(inputFile, " missing branch pattern(s): ", join(missingBranchPatterns, ", "));
+  if (!missingHltPatterns.empty()) log.warning(inputFile, " missing HLT pattern(s): ", join(missingHltPatterns, ", "));
 
   for (const auto &hlt : presentHlt) {
     if (std::find(keptBranches.begin(), keptBranches.end(), hlt) == keptBranches.end()) keptBranches.push_back(hlt);
