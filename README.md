@@ -4,7 +4,7 @@ C++17/ROOT `RDataFrame::Snapshot` based NanoAOD skim utility.
 
 ## Features
 
-- Reads a JSON configuration file to control input directories, branch keep list, HLT OR filters, threading, scratch flushing, and progress logging.
+- Reads a JSON configuration file to control input directories, branch keep list, HLT OR filters, process/thread parallelism, scratch flushing, and progress logging.
 - Recursively finds `.root` files below one or more configured input directories. Wildcards are supported in each input directory entry.
 - Preserves the input directory structure below `input_base_directory` when writing to `output_base_directory/<YYYYMMDD_HHMMSS>/`.
 - Writes skimmed ROOT files to a scratch run directory first, then flushes them to the final output directory when the configured scratch byte threshold is reached.
@@ -51,7 +51,8 @@ See [`config/skim_config_template.json`](config/skim_config_template.json).
 
 Important keys:
 
-- `threads`: number of ROOT implicit multi-threading threads.
+- `threads`: number of ROOT implicit multi-threading threads per process.
+- `processes`: number of parallel worker processes. Total CPU concurrency is roughly `threads * processes`, so tune both values for the host and storage system.
 - `input_base_directory`: base NanoAOD directory, default `/data2/common/NanoAOD/`.
 - `output_base_directory`: base skim output directory, default `/data2/common/skimmed_NanoAOD/`.
 - `scratch_directory`: temporary directory used before final flush, default `/scratch`.

@@ -13,6 +13,7 @@
 #include <glob.h>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -21,6 +22,8 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -29,6 +32,7 @@ namespace {
 
 struct Config {
   unsigned int threads = 1;
+  unsigned int processes = 1;
   fs::path inputBaseDir = "/data2/common/NanoAOD";
   fs::path outputBaseDir = "/data2/common/skimmed_NanoAOD";
   fs::path scratchDir = "/scratch";
@@ -42,8 +46,9 @@ struct Config {
 
 class Logger {
 public:
-  explicit Logger(const fs::path &path) : file_(path) {
-    if (!file_) throw std::runtime_error("Cannot open log file: " + path.string());
+  explicit Logger(const fs::path &path) : path_(path) {
+    std::ofstream file(path_, std::ios::trunc);
+    if (!file) throw std::runtime_error("Cannot open log file: " + path.string());
   }
 
   template <typename... Args> void info(Args &&...args) { write("INFO", std::forward<Args>(args)...); }
@@ -55,9 +60,9 @@ private:
     std::ostringstream message;
     (message << ... << args);
     const auto line = timestampNow() + " [" + level + "] " + message.str();
-    std::cout << line << '\n';
-    file_ << line << '\n';
-    file_.flush();
+    std::cout << line << std::endl;
+    std::ofstream file(path_, std::ios::app);
+    file << line << '\n';
   }
 
   static std::string timestampNow() {
@@ -70,7 +75,7 @@ private:
     return os.str();
   }
 
-  std::ofstream file_;
+  fs::path path_;
 };
 
 std::string runTimestamp() {
@@ -100,6 +105,8 @@ Config loadConfig(const fs::path &path) {
 
   Config cfg;
   cfg.threads = j.value("threads", cfg.threads);
+  cfg.processes = j.value("processes", cfg.processes);
+  if (cfg.processes == 0) throw std::runtime_error("processes must be at least 1");
   cfg.inputBaseDir = j.value("input_base_directory", cfg.inputBaseDir.string());
   cfg.outputBaseDir = j.value("output_base_directory", cfg.outputBaseDir.string());
   cfg.scratchDir = j.value("scratch_directory", cfg.scratchDir.string());
@@ -229,8 +236,17 @@ std::uintmax_t pendingBytes(const std::vector<std::pair<fs::path, fs::path>> &pe
   return total;
 }
 
+void enableImplicitMTOnce(unsigned int threads) {
+  static bool enabled = false;
+  if (!enabled && threads > 1) {
+    ROOT::EnableImplicitMT(threads);
+    enabled = true;
+  }
+}
+
 void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &scratchFile,
                  Logger &log) {
+  enableImplicitMTOnce(cfg.threads);
   std::unique_ptr<TFile> file(TFile::Open(inputFile.c_str(), "READ"));
   if (!file || file->IsZombie()) throw std::runtime_error("Cannot open ROOT file: " + inputFile.string());
   auto *tree = dynamic_cast<TTree *>(file->Get(cfg.treeName.c_str()));
@@ -259,6 +275,89 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
 }
 
+struct SkimJob {
+  fs::path inputFile;
+  fs::path scratchFile;
+  fs::path finalFile;
+};
+
+void markCompletedJob(const SkimJob &job, bool success, std::vector<std::pair<fs::path, fs::path>> &pending,
+                      std::size_t &processed, std::size_t &failed, std::size_t totalFiles, const Config &cfg,
+                      Logger &log) {
+  ++processed;
+  if (success) {
+    pending.emplace_back(job.scratchFile, job.finalFile);
+  } else {
+    ++failed;
+    std::error_code ec;
+    fs::remove(job.scratchFile, ec);
+    log.error("Failed skimming ", job.inputFile);
+  }
+
+  if (cfg.progressEveryFiles > 0 && processed % cfg.progressEveryFiles == 0) {
+    log.info("Progress: ", processed, "/", totalFiles, " file(s) processed, ", failed, " failed");
+  }
+  if (pendingBytes(pending) >= cfg.scratchFlushBytes) flushScratch(pending, log);
+}
+
+int runSequential(const Config &cfg, const std::vector<SkimJob> &jobs,
+                  std::vector<std::pair<fs::path, fs::path>> &pending, Logger &log) {
+  std::size_t processed = 0;
+  std::size_t failed = 0;
+  for (const auto &job : jobs) {
+    log.info("Skimming ", job.inputFile, " -> ", job.scratchFile);
+    bool success = true;
+    try {
+      skimOneFile(cfg, job.inputFile, job.scratchFile, log);
+    } catch (const std::exception &ex) {
+      success = false;
+      log.error("Exception while skimming ", job.inputFile, ": ", ex.what());
+    }
+    markCompletedJob(job, success, pending, processed, failed, jobs.size(), cfg, log);
+  }
+  return failed == 0 ? 0 : 1;
+}
+
+int runMultiprocess(const Config &cfg, const std::vector<SkimJob> &jobs,
+                    std::vector<std::pair<fs::path, fs::path>> &pending, Logger &log) {
+  std::map<pid_t, SkimJob> active;
+  std::size_t nextJob = 0;
+  std::size_t processed = 0;
+  std::size_t failed = 0;
+
+  auto launchNext = [&]() {
+    const auto &job = jobs.at(nextJob++);
+    log.info("Skimming ", job.inputFile, " -> ", job.scratchFile);
+    const pid_t pid = fork();
+    if (pid < 0) throw std::runtime_error("fork failed while launching " + job.inputFile.string());
+    if (pid == 0) {
+      try {
+        skimOneFile(cfg, job.inputFile, job.scratchFile, log);
+        _exit(0);
+      } catch (const std::exception &ex) {
+        log.error("Exception while skimming ", job.inputFile, ": ", ex.what());
+        _exit(1);
+      }
+    }
+    active.emplace(pid, job);
+  };
+
+  while (nextJob < jobs.size() || !active.empty()) {
+    while (nextJob < jobs.size() && active.size() < cfg.processes) launchNext();
+
+    int status = 0;
+    const pid_t done = waitpid(-1, &status, 0);
+    if (done < 0) throw std::runtime_error("waitpid failed");
+    auto it = active.find(done);
+    if (it == active.end()) continue;
+    const bool success = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    markCompletedJob(it->second, success, pending, processed, failed, jobs.size(), cfg, log);
+    active.erase(it);
+  }
+
+  return failed == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -269,12 +368,11 @@ int main(int argc, char **argv) {
 
   try {
     const auto cfg = loadConfig(argv[1]);
-    if (cfg.threads > 1) ROOT::EnableImplicitMT(cfg.threads);
 
     const fs::path runOutputDir = cfg.outputBaseDir / runTimestamp();
     fs::create_directories(runOutputDir);
     Logger log(runOutputDir / "skim_nanoaod.log");
-    log.info("Starting NanoAOD skim with ", cfg.threads, " thread(s)");
+    log.info("Starting NanoAOD skim with ", cfg.threads, " thread(s) per process and ", cfg.processes, " process(es)");
 
     const auto inputDirs = expandInputDirectories(cfg);
     if (inputDirs.empty()) throw std::runtime_error("No input directories matched the configuration");
@@ -283,26 +381,19 @@ int main(int argc, char **argv) {
 
     const fs::path scratchRunDir = cfg.scratchDir / ("skim_nanoaod_" + runOutputDir.filename().string());
     std::vector<std::pair<fs::path, fs::path>> pending;
-    std::size_t processed = 0;
-
+    std::vector<SkimJob> jobs;
+    jobs.reserve(rootFiles.size());
     for (const auto &inputFile : rootFiles) {
       const auto rel = relativeToBase(inputFile, cfg.inputBaseDir);
-      const fs::path scratchFile = scratchRunDir / rel;
-      const fs::path finalFile = runOutputDir / rel;
-      log.info("Skimming ", inputFile, " -> ", scratchFile);
-      skimOneFile(cfg, inputFile, scratchFile, log);
-      pending.emplace_back(scratchFile, finalFile);
-      ++processed;
-
-      if (cfg.progressEveryFiles > 0 && processed % cfg.progressEveryFiles == 0) {
-        log.info("Progress: ", processed, "/", rootFiles.size(), " file(s) processed");
-      }
-      if (pendingBytes(pending) >= cfg.scratchFlushBytes) flushScratch(pending, log);
+      jobs.push_back({inputFile, scratchRunDir / rel, runOutputDir / rel});
     }
 
+    const int status = cfg.processes > 1 ? runMultiprocess(cfg, jobs, pending, log)
+                                         : runSequential(cfg, jobs, pending, log);
     flushScratch(pending, log);
     fs::remove_all(scratchRunDir);
     log.info("Finished NanoAOD skim. Output directory: ", runOutputDir);
+    return status;
   } catch (const std::exception &ex) {
     std::cerr << "ERROR: " << ex.what() << '\n';
     return 1;

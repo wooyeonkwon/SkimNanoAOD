@@ -1,5 +1,6 @@
 {
-  "threads": 8,
+  "threads": 4,
+  "processes": 2,
   "input_base_directory": "/data2/common/NanoAOD/",
   "output_base_directory": "/data2/common/skimmed_NanoAOD/",
   "scratch_directory": "/scratch",
