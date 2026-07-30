@@ -10,6 +10,7 @@ C++17/ROOT `RDataFrame::Snapshot` based NanoAOD skim utility.
 - Writes skimmed ROOT files to a scratch run directory first, then flushes them to the final output directory when the configured scratch byte threshold is reached.
 - Logs execution details and missing configured branches/HLT paths to `skim_nanoaod.log` in the timestamped output directory.
 - Ignores missing keep-list branches and missing HLT paths with `WARNING` messages, then snapshots only the branches that exist in the input file.
+- Copies the NanoAOD `Runs` and `LuminosityBlocks` metadata trees unchanged so filtered MC samples retain their original normalization metadata.
 
 ## Build
 
@@ -60,6 +61,6 @@ Important keys:
 - `input_directories`: array of directories or wildcard patterns relative to `input_base_directory`; all subdirectories are searched.
 - `branches`: branch keep list. Shell-style wildcards such as `Muon_*` and `Jet_btag*` are allowed. Patterns that match no branch are logged as warnings and skipped.
 - `hlt_paths`: HLT branches combined with OR for event filtering. Shell-style wildcards such as `HLT_Mu*` are allowed. Patterns that match no HLT branch are logged as warnings and skipped.
-- For MC inputs with `genWeight`, all events remain in the regular `<tree_name>` tree so its `genWeight` sum still represents the original sample. HLT-selected events keep their configured branch values; for rejected events, `genWeight` is retained while every other output branch is set to its type's default value (zero/false for scalars and empty for vector-like branches). Inputs without `genWeight`, such as data, retain the original behavior of dropping HLT-rejected events.
+- The output `Events` tree contains only events selected by the HLT OR. The input `Runs` and `LuminosityBlocks` trees are copied without filtering, preserving NanoAOD normalization metadata such as `genEventSumw` without retaining rejected event entries. Use the summed `Runs/genEventSumw` values for MC normalization. Missing metadata trees are logged as warnings.
 - `progress_every_files`: progress log frequency in processed files.
 - `tree_name`: tree to skim, normally `Events` for NanoAOD.

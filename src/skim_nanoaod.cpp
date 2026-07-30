@@ -1,5 +1,6 @@
 #include <ROOT/RDataFrame.hxx>
 #include <TFile.h>
+#include <TObject.h>
 #include <TTree.h>
 
 #include <nlohmann/json.hpp>
@@ -20,7 +21,6 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <type_traits>
 #include <utility>
 #include <vector>
 #include <sys/wait.h>
@@ -245,6 +245,29 @@ void enableImplicitMTOnce(unsigned int threads) {
   }
 }
 
+void copyMetadataTrees(const fs::path &inputFile, const fs::path &outputFile, Logger &log) {
+  std::unique_ptr<TFile> input(TFile::Open(inputFile.c_str(), "READ"));
+  if (!input || input->IsZombie()) {
+    throw std::runtime_error("Cannot reopen ROOT file for metadata: " + inputFile.string());
+  }
+  std::unique_ptr<TFile> output(TFile::Open(outputFile.c_str(), "UPDATE"));
+  if (!output || output->IsZombie()) {
+    throw std::runtime_error("Cannot open skim file for metadata: " + outputFile.string());
+  }
+
+  for (const auto *treeName : {"Runs", "LuminosityBlocks"}) {
+    auto *tree = dynamic_cast<TTree *>(input->Get(treeName));
+    if (!tree) {
+      log.warning(inputFile, " has no ", treeName, " tree; it will not be present in the skim");
+      continue;
+    }
+    output->cd();
+    auto *copy = tree->CloneTree(-1, "fast");
+    if (!copy) throw std::runtime_error("Cannot clone metadata tree '" + std::string(treeName) + "'");
+    copy->Write(treeName, TObject::kOverwrite);
+  }
+}
+
 void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &scratchFile,
                  Logger &log) {
   enableImplicitMTOnce(cfg.threads);
@@ -264,36 +287,16 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   for (const auto &hlt : presentHlt) {
     if (std::find(keptBranches.begin(), keptBranches.end(), hlt) == keptBranches.end()) keptBranches.push_back(hlt);
   }
-  const bool hasGenWeight = std::find(available.begin(), available.end(), "genWeight") != available.end();
-  if (!presentHlt.empty() && hasGenWeight &&
-      std::find(keptBranches.begin(), keptBranches.end(), "genWeight") == keptBranches.end()) {
-    keptBranches.push_back("genWeight");
-  }
-
   file.reset();
   ROOT::RDataFrame df(cfg.treeName, inputFile.string());
+  auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
 
   fs::create_directories(scratchFile.parent_path());
   ROOT::RDF::RSnapshotOptions options;
   options.fMode = "RECREATE";
   options.fCompressionLevel = 4;
-  if (!presentHlt.empty() && hasGenWeight) {
-    constexpr auto passColumn = "__skimNanoAODPassHLT";
-    if (std::find(available.begin(), available.end(), passColumn) != available.end()) {
-      throw std::runtime_error("Reserved internal column already exists in " + inputFile.string() + ": " + passColumn);
-    }
-
-    ROOT::RDF::RNode output = df.Define(passColumn, join(presentHlt, " || "));
-    for (const auto &branch : keptBranches) {
-      if (branch == "genWeight") continue;
-      output = output.Redefine(branch, std::string(passColumn) + " ? " + branch +
-                                          " : std::decay_t<decltype(" + branch + ")>{}");
-    }
-    output.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
-  } else {
-    auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
-    filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
-  }
+  filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  copyMetadataTrees(inputFile, scratchFile, log);
 }
 
 struct SkimJob {
