@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #include <sys/wait.h>
@@ -271,21 +272,27 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
 
   file.reset();
   ROOT::RDataFrame df(cfg.treeName, inputFile.string());
-  auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
 
   fs::create_directories(scratchFile.parent_path());
   ROOT::RDF::RSnapshotOptions options;
   options.fMode = "RECREATE";
   options.fCompressionLevel = 4;
-  filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
-
   if (!presentHlt.empty() && hasGenWeight) {
-    options.fMode = "UPDATE";
-    const std::vector<std::string> weightBranch{"genWeight"};
-    df.Filter("!(" + join(presentHlt, " || ") + ")")
-        .Snapshot(cfg.treeName + "NotPassingHLT", scratchFile.string(), weightBranch, options);
-  } else if (!presentHlt.empty()) {
-    log.warning(inputFile, " has no genWeight branch; HLT-rejected event weights cannot be retained");
+    constexpr auto passColumn = "__skimNanoAODPassHLT";
+    if (std::find(available.begin(), available.end(), passColumn) != available.end()) {
+      throw std::runtime_error("Reserved internal column already exists in " + inputFile.string() + ": " + passColumn);
+    }
+
+    ROOT::RDF::RNode output = df.Define(passColumn, join(presentHlt, " || "));
+    for (const auto &branch : keptBranches) {
+      if (branch == "genWeight") continue;
+      output = output.Redefine(branch, std::string(passColumn) + " ? " + branch +
+                                          " : std::decay_t<decltype(" + branch + ")>{}");
+    }
+    output.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  } else {
+    auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
+    filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
   }
 }
 
