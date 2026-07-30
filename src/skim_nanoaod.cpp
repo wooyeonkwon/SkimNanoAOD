@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,7 @@ struct Config {
   std::vector<std::string> inputDirectories;
   std::vector<std::string> branches;
   std::vector<std::string> hltPaths;
+  std::string hltNormalizationWeightBranch = "hltNormalizationWeight";
   std::size_t progressEveryFiles = 100;
   std::string treeName = "Events";
 };
@@ -114,6 +116,8 @@ Config loadConfig(const fs::path &path) {
   cfg.inputDirectories = getStringArray(j, "input_directories");
   cfg.branches = getStringArray(j, "branches", false);
   cfg.hltPaths = getStringArray(j, "hlt_paths", false);
+  cfg.hltNormalizationWeightBranch =
+      j.value("hlt_normalization_weight_branch", cfg.hltNormalizationWeightBranch);
   cfg.progressEveryFiles = j.value("progress_every_files", cfg.progressEveryFiles);
   cfg.treeName = j.value("tree_name", cfg.treeName);
   return cfg;
@@ -244,8 +248,67 @@ void enableImplicitMTOnce(unsigned int threads) {
   }
 }
 
+struct HltNormalization {
+  bool enabled = false;
+  double weight = 1.0;
+  double totalGenWeight = 0.0;
+  double selectedGenWeight = 0.0;
+};
+
+HltNormalization computeHltNormalization(const Config &cfg,
+                                         const std::vector<fs::path> &inputFiles,
+                                         Logger &log) {
+  HltNormalization normalization;
+  if (cfg.hltPaths.empty() || cfg.hltNormalizationWeightBranch.empty() || inputFiles.empty()) {
+    return normalization;
+  }
+
+  enableImplicitMTOnce(cfg.threads);
+  for (const auto &inputFile : inputFiles) {
+    std::unique_ptr<TFile> file(TFile::Open(inputFile.c_str(), "READ"));
+    if (!file || file->IsZombie()) throw std::runtime_error("Cannot open ROOT file: " + inputFile.string());
+    auto *tree = dynamic_cast<TTree *>(file->Get(cfg.treeName.c_str()));
+    if (!tree) throw std::runtime_error("Cannot find tree '" + cfg.treeName + "' in " + inputFile.string());
+
+    const auto available = treeBranches(*tree);
+    if (std::find(available.begin(), available.end(), "genWeight") == available.end()) {
+      log.warning("Cannot create ", cfg.hltNormalizationWeightBranch, ": ", inputFile,
+                  " has no genWeight branch");
+      return {};
+    }
+    if (std::find(available.begin(), available.end(), cfg.hltNormalizationWeightBranch) != available.end()) {
+      throw std::runtime_error("Output weight branch already exists in " + inputFile.string() + ": " +
+                               cfg.hltNormalizationWeightBranch);
+    }
+
+    std::vector<std::string> missingHltPatterns;
+    const auto presentHlt = presentFromRequestedPatterns(cfg.hltPaths, available, missingHltPatterns);
+    file.reset();
+
+    ROOT::RDataFrame df(cfg.treeName, inputFile.string());
+    auto total = df.Sum("genWeight");
+    auto selected = presentHlt.empty() ? df.Sum("genWeight")
+                                       : df.Filter(join(presentHlt, " || ")).Sum("genWeight");
+    normalization.totalGenWeight += *total;
+    normalization.selectedGenWeight += *selected;
+  }
+
+  if (!std::isfinite(normalization.totalGenWeight) || normalization.totalGenWeight == 0.0) {
+    throw std::runtime_error("Cannot calculate HLT normalization weight: total genWeight sum is zero or non-finite");
+  }
+  normalization.weight = normalization.selectedGenWeight / normalization.totalGenWeight;
+  if (!std::isfinite(normalization.weight)) {
+    throw std::runtime_error("Cannot calculate HLT normalization weight: result is non-finite");
+  }
+  normalization.enabled = true;
+  log.info("HLT normalization: sum(genWeight) selected/total = ", normalization.selectedGenWeight,
+           "/", normalization.totalGenWeight, "; writing ", cfg.hltNormalizationWeightBranch,
+           " = ", normalization.weight);
+  return normalization;
+}
+
 void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &scratchFile,
-                 Logger &log) {
+                 const HltNormalization &normalization, Logger &log) {
   enableImplicitMTOnce(cfg.threads);
   std::unique_ptr<TFile> file(TFile::Open(inputFile.c_str(), "READ"));
   if (!file || file->IsZombie()) throw std::runtime_error("Cannot open ROOT file: " + inputFile.string());
@@ -268,11 +331,18 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   ROOT::RDataFrame df(cfg.treeName, inputFile.string());
   auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
 
+  if (normalization.enabled) keptBranches.push_back(cfg.hltNormalizationWeightBranch);
+
   fs::create_directories(scratchFile.parent_path());
   ROOT::RDF::RSnapshotOptions options;
   options.fMode = "RECREATE";
   options.fCompressionLevel = 4;
-  filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  if (normalization.enabled) {
+    filtered.Define(cfg.hltNormalizationWeightBranch, [weight = normalization.weight]() { return weight; })
+        .Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  } else {
+    filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  }
 }
 
 struct SkimJob {
@@ -300,7 +370,7 @@ void markCompletedJob(const SkimJob &job, bool success, std::vector<std::pair<fs
   if (pendingBytes(pending) >= cfg.scratchFlushBytes) flushScratch(pending, log);
 }
 
-int runSequential(const Config &cfg, const std::vector<SkimJob> &jobs,
+int runSequential(const Config &cfg, const HltNormalization &normalization, const std::vector<SkimJob> &jobs,
                   std::vector<std::pair<fs::path, fs::path>> &pending, Logger &log) {
   std::size_t processed = 0;
   std::size_t failed = 0;
@@ -308,7 +378,7 @@ int runSequential(const Config &cfg, const std::vector<SkimJob> &jobs,
     log.info("Skimming ", job.inputFile, " -> ", job.scratchFile);
     bool success = true;
     try {
-      skimOneFile(cfg, job.inputFile, job.scratchFile, log);
+      skimOneFile(cfg, job.inputFile, job.scratchFile, normalization, log);
     } catch (const std::exception &ex) {
       success = false;
       log.error("Exception while skimming ", job.inputFile, ": ", ex.what());
@@ -318,7 +388,7 @@ int runSequential(const Config &cfg, const std::vector<SkimJob> &jobs,
   return failed == 0 ? 0 : 1;
 }
 
-int runMultiprocess(const Config &cfg, const std::vector<SkimJob> &jobs,
+int runMultiprocess(const Config &cfg, const HltNormalization &normalization, const std::vector<SkimJob> &jobs,
                     std::vector<std::pair<fs::path, fs::path>> &pending, Logger &log) {
   std::map<pid_t, SkimJob> active;
   std::size_t nextJob = 0;
@@ -332,7 +402,7 @@ int runMultiprocess(const Config &cfg, const std::vector<SkimJob> &jobs,
     if (pid < 0) throw std::runtime_error("fork failed while launching " + job.inputFile.string());
     if (pid == 0) {
       try {
-        skimOneFile(cfg, job.inputFile, job.scratchFile, log);
+        skimOneFile(cfg, job.inputFile, job.scratchFile, normalization, log);
         _exit(0);
       } catch (const std::exception &ex) {
         log.error("Exception while skimming ", job.inputFile, ": ", ex.what());
@@ -378,6 +448,7 @@ int main(int argc, char **argv) {
     if (inputDirs.empty()) throw std::runtime_error("No input directories matched the configuration");
     const auto rootFiles = collectRootFiles(inputDirs);
     log.info("Found ", rootFiles.size(), " ROOT file(s) under ", inputDirs.size(), " input director(y/ies)");
+    const auto hltNormalization = computeHltNormalization(cfg, rootFiles, log);
 
     const fs::path scratchRunDir = cfg.scratchDir / ("skim_nanoaod_" + runOutputDir.filename().string());
     std::vector<std::pair<fs::path, fs::path>> pending;
@@ -388,8 +459,8 @@ int main(int argc, char **argv) {
       jobs.push_back({inputFile, scratchRunDir / rel, runOutputDir / rel});
     }
 
-    const int status = cfg.processes > 1 ? runMultiprocess(cfg, jobs, pending, log)
-                                         : runSequential(cfg, jobs, pending, log);
+    const int status = cfg.processes > 1 ? runMultiprocess(cfg, hltNormalization, jobs, pending, log)
+                                         : runSequential(cfg, hltNormalization, jobs, pending, log);
     flushScratch(pending, log);
     fs::remove_all(scratchRunDir);
     log.info("Finished NanoAOD skim. Output directory: ", runOutputDir);
