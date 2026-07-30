@@ -47,7 +47,6 @@
     "HLT_Mu50",
     "HLT_PFMET*"
   ],
-  "hlt_normalization_weight_branch": "hltNormalizationWeight",
   "progress_every_files": 100,
   "tree_name": "Events"
 }

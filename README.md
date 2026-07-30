@@ -60,6 +60,6 @@ Important keys:
 - `input_directories`: array of directories or wildcard patterns relative to `input_base_directory`; all subdirectories are searched.
 - `branches`: branch keep list. Shell-style wildcards such as `Muon_*` and `Jet_btag*` are allowed. Patterns that match no branch are logged as warnings and skipped.
 - `hlt_paths`: HLT branches combined with OR for event filtering. Shell-style wildcards such as `HLT_Mu*` are allowed. Patterns that match no HLT branch are logged as warnings and skipped.
-- `hlt_normalization_weight_branch`: name of a constant branch added to HLT-filtered MC events (default `hltNormalizationWeight`). Its value is `sum(genWeight after HLT) / sum(genWeight before HLT)`, calculated across all input files. When normalization is derived from the skim itself, use `genWeight * hltNormalizationWeight / sum(genWeight in skim)` so the denominator remains equivalent to the unfiltered sample. Set the name to an empty string to disable this branch. The branch is skipped with a warning when an input has no `genWeight`.
+- For MC inputs with `genWeight`, events rejected by the HLT OR are retained in a separate `<tree_name>NotPassingHLT` tree containing only `genWeight`. The regular `<tree_name>` tree still contains only HLT-selected events and the configured branches. Sum `genWeight` over both trees when calculating the original-sample normalization denominator.
 - `progress_every_files`: progress log frequency in processed files.
 - `tree_name`: tree to skim, normally `Events` for NanoAOD.
