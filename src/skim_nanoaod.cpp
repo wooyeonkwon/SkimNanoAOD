@@ -1,5 +1,6 @@
 #include <ROOT/RDataFrame.hxx>
 #include <TFile.h>
+#include <TObject.h>
 #include <TTree.h>
 
 #include <nlohmann/json.hpp>
@@ -244,6 +245,29 @@ void enableImplicitMTOnce(unsigned int threads) {
   }
 }
 
+void copyMetadataTrees(const fs::path &inputFile, const fs::path &outputFile, Logger &log) {
+  std::unique_ptr<TFile> input(TFile::Open(inputFile.c_str(), "READ"));
+  if (!input || input->IsZombie()) {
+    throw std::runtime_error("Cannot reopen ROOT file for metadata: " + inputFile.string());
+  }
+  std::unique_ptr<TFile> output(TFile::Open(outputFile.c_str(), "UPDATE"));
+  if (!output || output->IsZombie()) {
+    throw std::runtime_error("Cannot open skim file for metadata: " + outputFile.string());
+  }
+
+  for (const auto *treeName : {"Runs", "LuminosityBlocks"}) {
+    auto *tree = dynamic_cast<TTree *>(input->Get(treeName));
+    if (!tree) {
+      log.warning(inputFile, " has no ", treeName, " tree; it will not be present in the skim");
+      continue;
+    }
+    output->cd();
+    auto *copy = tree->CloneTree(-1, "fast");
+    if (!copy) throw std::runtime_error("Cannot clone metadata tree '" + std::string(treeName) + "'");
+    copy->Write(treeName, TObject::kOverwrite);
+  }
+}
+
 void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &scratchFile,
                  Logger &log) {
   enableImplicitMTOnce(cfg.threads);
@@ -263,7 +287,6 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   for (const auto &hlt : presentHlt) {
     if (std::find(keptBranches.begin(), keptBranches.end(), hlt) == keptBranches.end()) keptBranches.push_back(hlt);
   }
-
   file.reset();
   ROOT::RDataFrame df(cfg.treeName, inputFile.string());
   auto filtered = presentHlt.empty() ? df.Filter("true") : df.Filter(join(presentHlt, " || "));
@@ -273,6 +296,7 @@ void skimOneFile(const Config &cfg, const fs::path &inputFile, const fs::path &s
   options.fMode = "RECREATE";
   options.fCompressionLevel = 4;
   filtered.Snapshot(cfg.treeName, scratchFile.string(), keptBranches, options);
+  copyMetadataTrees(inputFile, scratchFile, log);
 }
 
 struct SkimJob {
